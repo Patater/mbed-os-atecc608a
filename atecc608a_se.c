@@ -154,7 +154,8 @@ psa_status_t atecc608a_deinit()
 
 static psa_status_t atecc608a_export_public_key(psa_drv_se_context_t *drv_context,
                                                 psa_key_slot_number_t key,
-                                                uint8_t *p_data, size_t data_size,
+                                                uint8_t *p_data,
+                                                size_t data_size,
                                                 size_t *p_data_length)
 {
     const size_t key_data_len = PSA_KEY_EXPORT_MAX_SIZE(
@@ -184,18 +185,18 @@ exit:
     atecc608a_deinit();
     return status;
 }
-static psa_status_t atecc608a_import_public_key(psa_drv_se_context_t *drv_context,
-                                                psa_key_slot_number_t key_slot,
-                                                psa_key_lifetime_t lifetime,
-                                                psa_key_type_t type,
-                                                psa_algorithm_t alg,
-                                                psa_key_usage_t usage,
-                                                const uint8_t *p_data,
-                                                size_t data_length,
-                                                size_t *bits)
+static psa_status_t atecc608a_import_public_key(
+    psa_drv_se_context_t *drv_context,
+    psa_key_slot_number_t key_slot,
+    const psa_key_attributes_t *attributes,
+    const uint8_t *data,
+    size_t data_length,
+    size_t *bits)
 {
     const uint16_t key_id = key_slot;
     psa_status_t status = PSA_ERROR_GENERIC_ERROR;
+    psa_key_type_t type = psa_get_key_type(attributes);
+    psa_algorithm_t alg = psa_get_key_algorithm(attributes);
 
     ASSERT_SUCCESS_PSA(is_public_key_slot(key_id));
 
@@ -217,23 +218,29 @@ static psa_status_t atecc608a_import_public_key(psa_drv_se_context_t *drv_contex
 
     ASSERT_SUCCESS_PSA(atecc608a_init());
 
-    ASSERT_SUCCESS(atcab_write_pubkey(key_id, pubkey_for_driver((uint8_t *) p_data)));
+    ASSERT_SUCCESS(atcab_write_pubkey(key_id, pubkey_for_driver((uint8_t *) data)));
+
+    if (bits != NULL) {
+        /* The 64-byte key is written as 72 bytes. See atcab_write_pubkey() for
+         * why 72 bytes. */
+        *bits = PSA_BYTES_TO_BITS(72);
+    }
+
 exit:
     atecc608a_deinit();
     return status;
 }
 
-static psa_status_t atecc608a_generate_key(psa_drv_se_context_t *drv_context,
-                                           psa_key_slot_number_t key_slot,
-                                           psa_key_type_t type,
-                                           psa_key_usage_t usage,
-                                           size_t bits,
-                                           uint8_t *p_pubkey_out,
-                                           size_t pubkey_out_size,
-                                           size_t *p_pubkey_length)
+static psa_status_t atecc608a_generate_key(
+    psa_drv_se_context_t *drv_context,
+    psa_key_slot_number_t key_slot,
+    const psa_key_attributes_t *attributes,
+    uint8_t *pubkey, size_t pubkey_size, size_t *pubkey_length)
 {
     const uint16_t key_id = key_slot;
     psa_status_t status = PSA_ERROR_GENERIC_ERROR;
+    psa_key_type_t type = psa_get_key_type(attributes);
+    size_t bits = psa_get_key_bits(attributes);
 
     /* The hardware has slots 0-15 */
     if (key_slot > 15) {
@@ -248,21 +255,21 @@ static psa_status_t atecc608a_generate_key(psa_drv_se_context_t *drv_context,
         return PSA_ERROR_NOT_SUPPORTED;
     }
 
-    if (p_pubkey_out != NULL && pubkey_out_size < 1 + ATCA_PUB_KEY_SIZE) {
+    if (pubkey != NULL && pubkey_size < 1 + ATCA_PUB_KEY_SIZE) {
         return PSA_ERROR_BUFFER_TOO_SMALL;
     }
 
     ASSERT_SUCCESS_PSA(atecc608a_init());
 
-    if (p_pubkey_out != NULL) {
-        ASSERT_SUCCESS(atcab_genkey(key_id, pubkey_for_driver(p_pubkey_out)));
-        pubkey_for_psa(p_pubkey_out);
+    if (pubkey != NULL) {
+        ASSERT_SUCCESS(atcab_genkey(key_id, pubkey_for_driver(pubkey)));
+        pubkey_for_psa(pubkey);
     } else {
         ASSERT_SUCCESS(atcab_genkey(key_id, NULL));
     }
 
-    if (p_pubkey_length != NULL) {
-        *p_pubkey_length = 1 + ATCA_PUB_KEY_SIZE;
+    if (pubkey_length != NULL) {
+        *pubkey_length = 1 + ATCA_PUB_KEY_SIZE;
     }
 
 exit:
@@ -386,20 +393,33 @@ exit:
     return status;
 }
 
-psa_status_t atecc608a_check_slot(psa_drv_se_context_t *drv_context,
-                                  const psa_key_attributes_t *attributes,
-                                  psa_key_slot_number_t key_slot)
+static psa_status_t atecc608a_validate_slot_number(
+    psa_drv_se_context_t *drv_context,
+    const psa_key_attributes_t *attributes,
+    psa_key_creation_method_t method,
+    psa_key_slot_number_t key_slot)
 {
-    if (PSA_KEY_TYPE_IS_ECC_KEY_PAIR(attributes->type)) {
+    psa_key_type_t type = psa_get_key_type(attributes);
+    if (PSA_KEY_TYPE_IS_ECC_KEY_PAIR(type)) {
         if (key_slot <= 15) {
             return PSA_SUCCESS;
         }
-    } else if (PSA_KEY_TYPE_IS_ECC_PUBLIC_KEY(attributes->type)) {
+    } else if (PSA_KEY_TYPE_IS_ECC_PUBLIC_KEY(type)) {
         if (key_slot >= 8 && key_slot <= 15) {
             return PSA_SUCCESS;
         }
     }
     return PSA_ERROR_NOT_SUPPORTED;
+}
+
+static psa_status_t atecc608a_allocate_key(
+    psa_drv_se_context_t *drv_context,
+    void *persistent_data,
+    const psa_key_attributes_t *attributes,
+    psa_key_creation_method_t method,
+    psa_key_slot_number_t *key_slot)
+{
+    return PSA_SUCCESS;
 }
 
 static psa_drv_se_asymmetric_t atecc608a_asymmetric = {
@@ -411,11 +431,13 @@ static psa_drv_se_asymmetric_t atecc608a_asymmetric = {
 
 static psa_drv_se_key_management_t atecc608a_key_management = {
     /* So far there is no public key import function in the API, so use this instead */
+    .p_allocate = atecc608a_allocate_key,
+    .p_validate_slot_number = atecc608a_validate_slot_number,
     .p_import = atecc608a_import_public_key,
     .p_generate = atecc608a_generate_key,
     .p_destroy = 0,
+    .p_export = 0,
     .p_export_public = atecc608a_export_public_key,
-    .p_check_slot = atecc608a_check_slot,
 };
 
 psa_drv_se_t atecc608a_drv_info = {
